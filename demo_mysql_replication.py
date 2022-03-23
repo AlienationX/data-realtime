@@ -15,8 +15,8 @@ stream = BinLogStreamReader(
     # log_pos=4为RotateEvent事件，一个文件只有一次，可以获取log_file和log_pos
     # 三个参数必须都设置，程序停止后的增量方案
     # resume_stream=True,
-    log_file="mysql-bin.000155",
-    log_pos=7326
+    log_file="mysql-bin.000185",
+    log_pos=0
 )
 
 log_file = stream.log_file

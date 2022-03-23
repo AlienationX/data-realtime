@@ -15,6 +15,7 @@ def create_producer():
     # 假设生产的消息为键值对（不是一定要键值对），且序列化方式为json
     producer = KafkaProducer(
         bootstrap_servers=['hadoop-prod03:9092'],
+        acks="all",
         key_serializer=lambda k: json.dumps(k).encode(),
         value_serializer=lambda v: json.dumps(v).encode()
     )

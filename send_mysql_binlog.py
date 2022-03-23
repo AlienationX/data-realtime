@@ -33,11 +33,12 @@ UPDATE test4 SET data = "update double" WHERE data = 'double';
 
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent
-from pymysqlreplication.event import RotateEvent
+from pymysqlreplication.event import RotateEvent, QueryEvent
 
 from datetime import datetime, date
 import json
 import sys
+import re
 
 from ComplexJsonEncoder import ComplexJsonEncoder
 from kafka_producer import create_producer, send_message
@@ -53,17 +54,22 @@ BINLOG_OFFSET_RECORD = "./records/binlog_offset.json"
 PREFIX = "data_sync"
 
 
-def parsing_mysql_binlog(p_log_file=None, p_log_pos=4):
+def parsing_mysql_binlog(p_log_file = None, p_log_pos = 4):
     # 如果binlog日志被清理或缺失，需要从数据库直接读取导入到kafka，然后通过时间戳等过滤之前的数据，比较麻烦
     # 所以实时还是推荐只计算最近的数据，kafka也存在默认的只保留7天数据，历史数据建议不管
+    # show binary logs;
+    # show master status;
+
+    schemas = ["test"]
+    tables = ["test4", "student"]
 
     stream = BinLogStreamReader(
         connection_settings=MYSQL_SETTINGS,
         server_id=SERVER_ID,
         blocking=True,  # 阻塞等待后续事件，会一直执行
-        only_schemas=["test"],
+        only_schemas=schemas,
         # ignored_schemas：包含要跳过的模式的数组
-        only_tables=["test4", "student"],
+        only_tables=tables,
         # ignored_tables：包含要跳过的表的数组
 
         # freeze_schema=True,  # 如果为True，则不支持ALTER TABLE。速度更快
@@ -71,7 +77,7 @@ def parsing_mysql_binlog(p_log_file=None, p_log_pos=4):
         log_file=p_log_file,  # 设置复制开始日志文件（不设置默认读取最后一个文件）
         log_pos=p_log_pos,  # 设置复制开始日志pos（resume_stream应该为True，增量方案，且两参数必须都指定）
         # skip_to_timestamp=0,  # 在达到指定的时间戳之前忽略所有事件
-        only_events=[DeleteRowsEvent, WriteRowsEvent, UpdateRowsEvent, RotateEvent]
+        only_events=[DeleteRowsEvent, WriteRowsEvent, UpdateRowsEvent, RotateEvent, QueryEvent]
     )
 
     log_file = stream.log_file
@@ -79,54 +85,73 @@ def parsing_mysql_binlog(p_log_file=None, p_log_pos=4):
     for binlog_event in stream:
         # print(binlog_event.dump())  # 打印所有信息
 
+        # 解析下一个binlog文件
         if isinstance(binlog_event, RotateEvent):
             log_file = binlog_event.next_binlog
             continue
 
         # 增加log_file, log_pos, log_time
         log_pos = binlog_event.packet.log_pos
-        table_pk_list = [binlog_event.primary_key] if isinstance(binlog_event.primary_key, str) else binlog_event.primary_key
         event = {
             "log_file": log_file,  # 为了效率可以去掉，binlog_offset已经记录
             "log_pos": log_pos,  # 为了效率可以去掉，binlog_offset已经记录
             "log_time": str(datetime.fromtimestamp(binlog_event.timestamp)),  # binlog_event.packet.timestamp  # 冗余字段
-            "log_timestamp": binlog_event.timestamp,
-            "schema": binlog_event.schema,
-            "table": binlog_event.table,
-            "table_pk": table_pk_list,
+            "log_timestamp": binlog_event.timestamp
         }
 
-        # QueryEvent负责DDL语句(Query!="BEGIN")，WriteRowsEvent、UpdateRowsEvent、DeleteRowsEvent负责DML语句
-        if isinstance(binlog_event, DeleteRowsEvent):
-            event["action"] = "delete"
-        elif isinstance(binlog_event, UpdateRowsEvent):
-            event["action"] = "update"
-            # event["before_values"] = row["before_values"]
-            # event["after_values"] = row["after_values"]
-        elif isinstance(binlog_event, WriteRowsEvent):
-            event["action"] = "insert"
+        if isinstance(binlog_event, QueryEvent):
+            # 获取DDL语句
+            ddl_sql = binlog_event.query
+            tbl = re.findall(r"table (.*?) ", ddl_sql, re.I)
+            table = ""
+            if tbl:
+                tbl = tbl[0].replace("`", "").split(".")  # `db`.`table` 有的存在库名，有的存在`符号
+                table = tbl[-1]
 
-        event["data"] = binlog_event.rows
+            if table in tables:
+                event["schema"] = binlog_event.schema.decode('utf-8')  # bytes类型转str bytes.decode('utf-8')
+                event["table"] = table
+                event["action"] = "ddl"
+                event["data"] = ddl_sql
+            else:
+                continue
+        else:  # WriteRowsEvent UpdateRowsEvent DeleteRowsEvent
+            table_pk_list = [binlog_event.primary_key] if isinstance(binlog_event.primary_key, str) else binlog_event.primary_key
+            event["schema"] = binlog_event.schema
+            event["table"] = binlog_event.table
+            event["table_pk"] = table_pk_list  # dml语句多出来的字段
 
-        # # 一行行遍历和发送，效率太低，推荐以批次形式发送，同mysql的批次
-        # for row in binlog_event.rows:
-        #     event["schema"] = binlog_event.schema
-        #     event["table"] = binlog_event.table
-        #     event["table_pk"] = binlog_event.primary_key
-        #
-        #     if isinstance(binlog_event, DeleteRowsEvent):
-        #         event["action"] = "delete"
-        #         event["values"] = row["values"]
-        #     elif isinstance(binlog_event, UpdateRowsEvent):
-        #         event["action"] = "update"
-        #         event["before_values"] = row["before_values"]
-        #         event["after_values"] = row["after_values"]
-        #     elif isinstance(binlog_event, WriteRowsEvent):
-        #         event["action"] = "insert"
-        #         event["values"] = row["values"]
-        #
-        #     print(event)
-        #     # sys.stdout.flush()
+            # QueryEvent负责DDL语句(Query!="BEGIN")，WriteRowsEvent、UpdateRowsEvent、DeleteRowsEvent负责DML语句
+            if isinstance(binlog_event, WriteRowsEvent):
+                event["action"] = "insert"
+            elif isinstance(binlog_event, UpdateRowsEvent):
+                event["action"] = "update"
+                # event["before_values"] = row["before_values"]
+                # event["after_values"] = row["after_values"]
+            elif isinstance(binlog_event, DeleteRowsEvent):
+                event["action"] = "delete"
+
+            event["data"] = binlog_event.rows
+
+            # # 一行行遍历和发送，效率太低，推荐以批次形式发送，同mysql的批次
+            # for row in binlog_event.rows:
+            #     event["schema"] = binlog_event.schema
+            #     event["table"] = binlog_event.table
+            #     event["table_pk"] = binlog_event.primary_key
+            #
+            #     if isinstance(binlog_event, DeleteRowsEvent):
+            #         event["action"] = "delete"
+            #         event["values"] = row["values"]
+            #     elif isinstance(binlog_event, UpdateRowsEvent):
+            #         event["action"] = "update"
+            #         event["before_values"] = row["before_values"]
+            #         event["after_values"] = row["after_values"]
+            #     elif isinstance(binlog_event, WriteRowsEvent):
+            #         event["action"] = "insert"
+            #         event["values"] = row["values"]
+            #
+            #     print(event)
+            #     # sys.stdout.flush()
 
         # print(event)
 
@@ -177,6 +202,6 @@ def write_offset(content):
 if __name__ == "__main__":
     config = read_offset()
     print(config)
-    log_file = config["log_file"]
-    log_pos = config["log_pos"]
-    parsing_mysql_binlog(log_file, log_pos)
+    p_log_file = config["log_file"]
+    p_log_pos = config["log_pos"]
+    parsing_mysql_binlog(p_log_file, p_log_pos)
