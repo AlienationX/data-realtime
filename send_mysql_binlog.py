@@ -111,7 +111,7 @@ def parsing_mysql_binlog(p_log_file = None, p_log_pos = 4):
             if table in tables:
                 event["schema"] = binlog_event.schema.decode('utf-8')  # bytes类型转str bytes.decode('utf-8')
                 event["table"] = table
-                event["action"] = "ddl"
+                event["action"] = "DDL"
                 event["data"] = ddl_sql
             else:
                 continue
@@ -123,13 +123,13 @@ def parsing_mysql_binlog(p_log_file = None, p_log_pos = 4):
 
             # QueryEvent负责DDL语句(Query!="BEGIN")，WriteRowsEvent、UpdateRowsEvent、DeleteRowsEvent负责DML语句
             if isinstance(binlog_event, WriteRowsEvent):
-                event["action"] = "insert"
+                event["action"] = "I"
             elif isinstance(binlog_event, UpdateRowsEvent):
-                event["action"] = "update"
-                # event["before_values"] = row["before_values"]
+                event["action"] = "U"
+                # event["before_values"] = row["before_valus"]
                 # event["after_values"] = row["after_values"]
             elif isinstance(binlog_event, DeleteRowsEvent):
-                event["action"] = "delete"
+                event["action"] = "D"
 
             event["data"] = binlog_event.rows
 
